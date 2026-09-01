@@ -2,7 +2,6 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { execFile, spawn } from "node:child_process";
 import {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -10,54 +9,98 @@ import {
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import QRCode from "qrcode";
 import {
   isAllowedSender,
-  isRestartCommand,
-  isStatusCommand,
   loadEnvFile,
-  makePrompt,
-  makeStatusText,
   normalizeWhatsAppId,
   parseAllowedSenders,
   splitMessage,
+  toWhatsAppJid,
 } from "./lib.mjs";
 
 loadEnvFile(path.resolve(".env"));
 
 const config = {
-  allowedSenders: parseAllowedSenders(process.env.WHATSAPP_ALLOWED_SENDERS || ""),
-  mode: process.env.WHATSAPP_MODE || "self-chat",
   sessionDir: process.env.SESSION_DIR || "./session",
-  healthHost: process.env.HEALTH_HOST || "127.0.0.1",
-  healthPort: Number.parseInt(process.env.HEALTH_PORT || "3091", 10),
-  piBin: process.env.PI_BIN || "pi",
-  piWorkdir: process.env.PI_WORKDIR || ".",
-  piModel: process.env.PI_MODEL || "ollama/qwen3.6-35b-a3b-q8:latest",
-  piThinking: process.env.PI_THINKING || "high",
-  piTimeoutMs: Number.parseInt(process.env.PI_TIMEOUT_MS || "900000", 10),
-  appendSystemPrompt: process.env.PI_APPEND_SYSTEM_PROMPT || "",
-  replyPrefix: process.env.SELF_CHAT_REPLY_PREFIX || "Pi Agent",
+  host: process.env.WHATSAPP_HOST || process.env.HTTP_HOST || "127.0.0.1",
+  port: Number.parseInt(process.env.WHATSAPP_PORT || process.env.HTTP_PORT || "3091", 10),
+  webhookToken: process.env.WEBHOOK_TOKEN || "",
+  messageLimit: Number.parseInt(process.env.WHATSAPP_MESSAGE_LIMIT || "3900", 10),
+  inboundWebhookUrl: process.env.WHATSAPP_INBOUND_URL || "",
+  inboundWebhookToken: process.env.INBOUND_WEBHOOK_TOKEN || "",
+  inboundAllowedSenders: parseAllowedSenders(process.env.WHATSAPP_INBOUND_ALLOWED_SENDERS || ""),
+  inboundMode: process.env.WHATSAPP_INBOUND_MODE || "bot",
 };
 
-if (!["bot", "self-chat"].includes(config.mode)) {
-  throw new Error("WHATSAPP_MODE must be bot or self-chat");
+if (!config.webhookToken) {
+  throw new Error("WEBHOOK_TOKEN is required");
 }
-if (!config.allowedSenders.size) {
-  throw new Error("WHATSAPP_ALLOWED_SENDERS is required");
+if (!Number.isInteger(config.messageLimit) || config.messageLimit < 1) {
+  throw new Error("WHATSAPP_MESSAGE_LIMIT must be a positive integer");
+}
+if (!["bot", "self-chat"].includes(config.inboundMode)) {
+  throw new Error("WHATSAPP_INBOUND_MODE must be bot or self-chat");
 }
 
 const startedAt = new Date();
 const logger = pino({ level: process.env.WHATSAPP_DEBUG ? "debug" : "warn" });
-const recentlySentIds = new Set();
 let sock = null;
 let status = "starting";
-let processed = 0;
-let lastMessageAt = null;
+let sent = 0;
+let received = 0;
+let lastSentAt = null;
+let lastReceivedAt = null;
+let forwarded = 0;
 let stopping = false;
+let reconnectTimer = null;
+const seenMessageIds = new Set();
+const recentlySentIds = new Set();
 
 function log(level, message, fields = {}) {
   const suffix = Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : "";
   process.stderr.write(`${new Date().toISOString()} ${level} ${message}${suffix}\n`);
+}
+
+function sendJson(res, statusCode, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+function isAuthorized(req) {
+  const authorization = String(req.headers.authorization || "");
+  const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  const supplied = bearer || String(req.headers["x-webhook-token"] || "");
+  return supplied === config.webhookToken;
+}
+
+function readJson(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      size += Buffer.byteLength(chunk);
+      if (size > maxBytes) {
+        reject(new Error("request body is too large"));
+        req.destroy();
+        return;
+      }
+      body += chunk;
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error("request body must be valid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 function getMessageContent(msg) {
@@ -80,153 +123,134 @@ function isSelfChat(chatId) {
   return Boolean(chat && (chat === myNumber || chat === myLid));
 }
 
-function shouldAccept(msg) {
-  const chatId = msg.key.remoteJid || "";
-  const senderId = msg.key.participant || chatId;
-  const fromMe = Boolean(msg.key.fromMe);
-  const isGroup = chatId.endsWith("@g.us");
-  if (isGroup) return false;
+async function sendText(to, text) {
+  const chatId = toWhatsAppJid(to);
+  if (!sock || status !== "connected") {
+    throw new Error("WhatsApp is not connected");
+  }
+  const chunks = splitMessage(text, config.messageLimit);
+  if (!chunks.length) throw new Error("message is required");
 
-  if (config.mode === "bot") {
-    return !fromMe && isAllowedSender(senderId, config.allowedSenders);
+  const messageIds = [];
+  for (const chunk of chunks) {
+    const result = await sock.sendMessage(chatId, { text: chunk });
+    if (result?.key?.id) {
+      messageIds.push(result.key.id);
+      recentlySentIds.add(result.key.id);
+      while (recentlySentIds.size > 1000) recentlySentIds.delete(recentlySentIds.values().next().value);
+    }
+    sent += 1;
+    lastSentAt = new Date().toISOString();
+  }
+  return { to: chatId, messageIds };
+}
+
+async function handleWebhook(req, res) {
+  if (!isAuthorized(req)) {
+    sendJson(res, 401, { ok: false, error: "unauthorized" });
+    return;
   }
 
-  if (!fromMe || !isSelfChat(chatId)) return false;
-  if (recentlySentIds.has(msg.key.id)) return false;
-  const text = getText(msg);
-  if (config.replyPrefix && text.startsWith(config.replyPrefix)) return false;
-  return true;
-}
+  let body;
+  try {
+    body = await readJson(req);
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: error.message });
+    return;
+  }
 
-function execFileText(file, args) {
-  return new Promise((resolve) => {
-    execFile(file, args, { timeout: 5000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) resolve(stderr || error.message);
-      else resolve(stdout);
+  const to = body?.to ?? body?.chatId ?? body?.recipient ?? body?.phone;
+  const message = body?.message ?? body?.text ?? body?.body;
+  if (typeof message !== "string" || !message.trim()) {
+    sendJson(res, 400, {
+      ok: false,
+      error: "message is required",
+      usage: { to: "15551234567", message: "hello" },
     });
-  });
-}
+    return;
+  }
 
-async function runPi(event) {
-  const args = [
-    "--no-approve",
-    "--no-builtin-tools",
-    "--model",
-    config.piModel,
-    "--thinking",
-    config.piThinking,
-  ];
-  if (config.appendSystemPrompt) args.push("--append-system-prompt", config.appendSystemPrompt);
-  args.push("--session-id", `whatsapp-${normalizeWhatsAppId(event.senderId || event.chatId)}`);
-  args.push("--name", "WhatsApp");
-  args.push("-p", makePrompt({ mode: config.mode, event }));
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(config.piBin, args, {
-      cwd: config.piWorkdir,
-      env: { ...process.env, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-      reject(new Error(`pi timed out after ${config.piTimeoutMs}ms`));
-    }, config.piTimeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout.trim() || "I do not have a response.");
-      else reject(new Error(`pi exited ${code}: ${stderr.slice(-1000)}`));
-    });
-  });
-}
-
-async function sendText(chatId, text) {
-  const body = config.mode === "self-chat" && config.replyPrefix
-    ? `${config.replyPrefix}\n${text}`
-    : text;
-  for (const chunk of splitMessage(body)) {
-    const sent = await sock.sendMessage(chatId, { text: chunk });
-    if (sent?.key?.id) recentlySentIds.add(sent.key.id);
-    while (recentlySentIds.size > 100) recentlySentIds.delete(recentlySentIds.values().next().value);
+  try {
+    const result = await sendText(to, message);
+    sendJson(res, 200, { ok: true, ...result });
+  } catch (error) {
+    const isConnectionError = error.message === "WhatsApp is not connected";
+    sendJson(res, isConnectionError ? 503 : 400, { ok: false, error: error.message });
   }
 }
 
-async function statusText() {
-  const crontabText = await execFileText("crontab", ["-l"]);
-  return makeStatusText({
-    model: config.piModel,
-    thinking: config.piThinking,
-    startedAt,
-    crontabText,
-  });
-}
-
-async function handleMessage(msg) {
-  if (!shouldAccept(msg)) return;
-  const body = getText(msg);
-  if (!body) return;
-
-  const event = {
-    messageId: msg.key.id,
-    chatId: msg.key.remoteJid,
-    senderId: msg.key.participant || msg.key.remoteJid,
-    body,
-  };
-
-  log("info", "processing WhatsApp message", { messageId: event.messageId });
-  let reply;
-  let restart = false;
-  if (isStatusCommand(body)) {
-    reply = await statusText();
-  } else if (isRestartCommand(body)) {
-    reply = "Restarting Pi WhatsApp gateway and refreshing the WhatsApp connection now.";
-    restart = true;
-  } else {
-    reply = await runPi(event);
+async function forwardInbound(message) {
+  if (!config.inboundWebhookUrl || !config.inboundWebhookToken) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(config.inboundWebhookUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.inboundWebhookToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(message),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`HTTP ${response.status}: ${body || "inbound webhook failed"}`);
+    }
+    forwarded += 1;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  await sendText(event.chatId, reply);
-  processed += 1;
-  lastMessageAt = new Date().toISOString();
-  if (restart) setTimeout(() => process.exit(0), 1000).unref();
 }
 
-function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url !== "/health") {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "not found" }));
+function startHttpServer() {
+  const server = http.createServer(async (req, res) => {
+    const requestUrl = new URL(req.url || "/", `http://${config.host}`);
+    const method = req.method || "GET";
+
+    if (method === "GET" && requestUrl.pathname === "/health") {
+      sendJson(res, 200, {
+        ok: true,
+        status,
+        uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+        sent,
+        received,
+        forwarded,
+        inboundEnabled: Boolean(config.inboundWebhookUrl && config.inboundWebhookToken),
+        lastSentAt,
+        lastReceivedAt,
+      });
       return;
     }
-    const body = JSON.stringify({
-      ok: true,
-      status,
-      mode: config.mode,
-      processed,
-      lastMessageAt,
-      uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
-    });
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(body);
+
+    if (method === "GET" && requestUrl.pathname === "/") {
+      sendJson(res, 200, {
+        ok: true,
+        service: "whatsapp",
+        endpoints: { health: "GET /health", webhook: "POST /webhook" },
+      });
+      return;
+    }
+
+    if (method === "POST" && ["/webhook", "/send"].includes(requestUrl.pathname)) {
+      await handleWebhook(req, res);
+      return;
+    }
+
+    sendJson(res, method === "POST" ? 404 : 405, { ok: false, error: "not found" });
   });
-  server.listen(config.healthPort, config.healthHost, () => {
-    log("info", "health endpoint listening", { host: config.healthHost, port: config.healthPort });
+
+  server.on("clientError", (error, socket) => {
+    log("warn", "HTTP client error", { error: error.message });
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  });
+  server.listen(config.port, config.host, () => {
+    log("info", "WhatsApp HTTP service listening", { host: config.host, port: config.port });
   });
 }
 
 async function startSocket() {
+  status = "connecting";
   fs.mkdirSync(config.sessionDir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
   const { version } = await fetchLatestBaileysVersion();
@@ -234,15 +258,19 @@ async function startSocket() {
     version,
     auth: state,
     logger,
-    printQRInTerminal: true,
-    browser: ["Pi WhatsApp Setup", "Chrome", "120.0"],
+    browser: ["WhatsApp Service", "Chrome", "120.0"],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     getMessage: async () => ({ conversation: "" }),
   });
 
   sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
+    if (update.qr) {
+      const terminalQr = await QRCode.toString(update.qr, { type: "terminal", small: false });
+      console.log("\nScan this QR code with WhatsApp > Linked devices > Link a device:\n");
+      console.log(terminalQr);
+    }
     if (update.connection === "open") {
       status = "connected";
       log("info", "WhatsApp connected");
@@ -250,19 +278,48 @@ async function startSocket() {
     if (update.connection === "close") {
       const reason = update.lastDisconnect?.error?.output?.statusCode;
       status = "disconnected";
-      if (reason === DisconnectReason.loggedOut || stopping) process.exit(reason === DisconnectReason.loggedOut ? 1 : 0);
+      if (reason === DisconnectReason.loggedOut || stopping) {
+        process.exit(reason === DisconnectReason.loggedOut ? 1 : 0);
+      }
       log("warn", "WhatsApp connection closed; reconnecting", { reason });
-      setTimeout(startSocket, reason === 515 ? 1000 : 3000).unref();
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          startSocket().catch((error) => log("error", "WhatsApp reconnect failed", { error: error.message }));
+        }, reason === 515 ? 1000 : 3000);
+        reconnectTimer.unref();
+      }
     }
   });
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify" && type !== "append") return;
+  sock.ev.on("messages.upsert", ({ messages, type }) => {
+    if (type !== "notify") return;
     for (const msg of messages) {
-      try {
-        await handleMessage(msg);
-      } catch (error) {
-        log("error", "message handling failed", { error: error.message });
+      const text = getText(msg);
+      if (!text) continue;
+      const messageId = msg.key?.id || "";
+      const chatId = msg.key?.remoteJid || "";
+      if (msg.key?.fromMe) {
+        const selfChatMessage = config.inboundMode === "self-chat" && isSelfChat(chatId);
+        if (!selfChatMessage || recentlySentIds.has(messageId)) continue;
       }
+      if (messageId && seenMessageIds.has(messageId)) continue;
+      if (messageId) {
+        seenMessageIds.add(messageId);
+        while (seenMessageIds.size > 1000) seenMessageIds.delete(seenMessageIds.values().next().value);
+      }
+      received += 1;
+      lastReceivedAt = new Date().toISOString();
+
+      const senderId = msg.key?.participant || chatId;
+      if (!isAllowedSender(senderId, config.inboundAllowedSenders)) continue;
+      void forwardInbound({
+        type: "whatsapp_message",
+        messageId,
+        chatId,
+        senderId,
+        body: text,
+        timestamp: Number(msg.messageTimestamp || Date.now()),
+      }).catch((error) => log("warn", "inbound webhook failed", { error: error.message }));
     }
   });
 }
@@ -276,6 +333,5 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
-startHealthServer();
+startHttpServer();
 await startSocket();
-

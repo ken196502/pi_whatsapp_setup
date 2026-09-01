@@ -1,5 +1,5 @@
 [Unit]
-Description=Pi WhatsApp Gateway
+Description=WhatsApp Service
 After=network-online.target
 Wants=network-online.target
 
@@ -13,4 +13,3 @@ Environment=NODE_ENV=production
 
 [Install]
 WantedBy=default.target
-

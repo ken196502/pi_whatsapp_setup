@@ -30,6 +30,7 @@ async function writeQr(qr) {
   const pngPath = path.join(pairingDir, "latest-qr.png");
   const htmlPath = path.join(pairingDir, "latest-qr.html");
   await QRCode.toFile(pngPath, qr, { width: 768, margin: 2 });
+  const terminalQr = await QRCode.toString(qr, { type: "terminal", small: false });
   fs.writeFileSync(path.join(pairingDir, "latest-qr.txt"), `${qr}\n`);
   fs.writeFileSync(
     htmlPath,
@@ -39,7 +40,7 @@ async function writeQr(qr) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="20">
-  <title>Pi WhatsApp Pairing QR</title>
+  <title>WhatsApp Service Pairing QR</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; background: #f7f7f5; color: #111; }
     main { max-width: 820px; margin: 0 auto; }
@@ -49,7 +50,7 @@ async function writeQr(qr) {
 </head>
 <body>
   <main>
-    <h1>Pi WhatsApp Pairing QR</h1>
+    <h1>WhatsApp Service Pairing QR</h1>
     <p>Open WhatsApp, go to <code>Linked devices</code>, and scan this QR.</p>
     <img src="latest-qr.png?ts=${Date.now()}" alt="WhatsApp pairing QR">
     <p>This page refreshes every 20 seconds because WhatsApp QR codes rotate.</p>
@@ -59,6 +60,8 @@ async function writeQr(qr) {
 `
   );
   writeStatus({ status: "qr_ready", pngPath, htmlPath });
+  console.log("\nScan this QR code with WhatsApp > Linked devices > Link a device:\n");
+  console.log(terminalQr);
   console.error(`QR page: ${htmlPath}`);
 }
 
@@ -68,7 +71,6 @@ const sock = makeWASocket({
   version,
   auth: state,
   logger: pino({ level: "warn" }),
-  printQRInTerminal: true,
   browser: ["Pi WhatsApp Setup", "Chrome", "120.0"],
   syncFullHistory: false,
   markOnlineOnConnect: false,
@@ -90,4 +92,3 @@ sock.ev.on("connection.update", async (update) => {
     if (reason === DisconnectReason.loggedOut) process.exit(1);
   }
 });
-

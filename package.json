@@ -1,12 +1,11 @@
 {
-  "name": "pi-whatsapp-setup",
+  "name": "pi-whatsapp-service",
   "version": "0.1.0",
   "private": false,
-  "description": "WhatsApp setup for Pi Agent: a local WhatsApp Web/Baileys bridge for running Pi from WhatsApp.",
+  "description": "A small WhatsApp Web service with QR pairing and an authenticated HTTP webhook for sending messages.",
   "type": "module",
   "keywords": [
-    "pi-package",
-    "pi-agent",
+    "pi-coding-agent",
     "whatsapp",
     "whatsapp-web",
     "baileys",
@@ -29,24 +28,18 @@
   "homepage": "https://github.com/aifunmobi/pi_whatsapp_setup#readme",
   "files": [
     ".env.example",
-    "docs/",
+    "extensions/",
     "launchd/",
-    "skills/",
     "src/",
     "systemd/",
-    "test/",
     "LICENSE",
     "README.md"
   ],
-  "pi": {
-    "skills": [
-      "./skills"
-    ]
-  },
   "scripts": {
     "pair": "node src/pair.mjs",
     "start": "node src/gateway.mjs",
-    "check": "node --check src/lib.mjs && node --check src/gateway.mjs && node --check src/pair.mjs && node --check test/lib.test.mjs",
+    "send": "node src/send.mjs",
+    "check": "node --check src/lib.mjs && node --check src/gateway.mjs && node --check src/pair.mjs && node --check src/send.mjs && node --check extensions/whatsapp-mirror.mjs && node --check test/lib.test.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

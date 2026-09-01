@@ -1,309 +1,188 @@
-# WhatsApp Setup for Pi Agent
+# WhatsApp Service
 
-A minimal, public-safe WhatsApp Web bridge for running [Pi Agent](https://github.com/earendil-works/pi) from WhatsApp.
+一个基于 Baileys 的轻量 WhatsApp Web 服务：负责 QR 配对、保持连接，并通过 HTTP webhook 发 WhatsApp 文本消息。
 
-This repo shows how to connect Pi Agent to WhatsApp using [Baileys](https://github.com/WhiskeySockets/Baileys), a local Node.js gateway, a QR-linked WhatsApp Web session, and the `pi` CLI. It is intended for personal automation, local agent experiments, and self-hosted AI assistant workflows.
+服务本身不运行 Pi。启用 Pi TUI extension 后，WhatsApp 入站消息会注入同一个 Pi session，Pi 的每条 assistant 回复则同时显示在 TUI 并镜像到 WhatsApp。
 
-Keywords: Pi Agent, Pi package, WhatsApp, WhatsApp Web, Baileys, local AI agent, self-hosted assistant, chat bridge, personal automation, agent gateway.
-
-## What This Does
-
-The gateway:
-
-- links a WhatsApp account through WhatsApp Web QR pairing
-- receives WhatsApp text messages locally
-- allowlists the sender before running Pi
-- invokes the `pi` CLI with a defensive prompt wrapper
-- sends Pi's response back to WhatsApp
-- exposes a local health endpoint
-- supports `/status`, `/restart`, and `/resart`
-- includes launchd and systemd templates for auto-restart after reboot
-
-This does not use Meta's official WhatsApp Cloud API. For production business messaging, use the official Cloud API instead.
-
-## Safety Notes
-
-- WhatsApp Web automation is unofficial and can be fragile.
-- Use a dedicated assistant number when possible.
-- Always set `WHATSAPP_ALLOWED_SENDERS`.
-- Never commit `.env`, `session/`, `pairing/`, logs, QR files, or secrets.
-- Treat WhatsApp messages as untrusted input.
-- Start in `self-chat` mode only if you understand that messages you send to yourself are treated as Pi input.
-
-The included prompt wrapper tells Pi that WhatsApp text is untrusted and that it must not obey phishing, spoofing, prompt-injection, credential theft, exfiltration, or secret-revealing requests.
-
-## Requirements
+## 要求
 
 - Node.js 20+
 - npm
-- Pi Agent installed and available as `pi`
-- A WhatsApp account that can link a new device
+- 一个可以绑定新设备的 WhatsApp 账号
 
-Check Pi first:
-
-```bash
-pi --version
-pi --offline --list-models
-```
-
-## Install As A Pi Package
-
-From GitHub:
-
-```bash
-pi install https://github.com/aifunmobi/pi_whatsapp_setup
-```
-
-After the npm package is published:
-
-```bash
-pi install npm:pi-whatsapp-setup
-```
-
-This loads the included `whatsapp-setup` skill into Pi. The gateway itself is still configured and run locally from this repo or from the npm package files.
-
-## Quick Start
-
-Install dependencies:
+## 启动
 
 ```bash
 npm install
-```
-
-Create local config:
-
-```bash
 cp .env.example .env
-$EDITOR .env
 ```
 
-At minimum, set:
+编辑 `.env`，至少修改 `WEBHOOK_TOKEN`：
 
 ```dotenv
-WHATSAPP_ALLOWED_SENDERS=15551234567
-WHATSAPP_MODE=self-chat
+WEBHOOK_TOKEN=replace-with-a-long-random-token
+WHATSAPP_HOST=127.0.0.1
+WHATSAPP_PORT=3091
+SESSION_DIR=./session
 ```
 
-Use country code only, with no `+`, spaces, or dashes.
-
-Pair WhatsApp:
+首次运行需要扫码配对：
 
 ```bash
 npm run pair
-open pairing/latest-qr.html
+open pairing/latest-qr.html       # macOS；其他系统直接打开该 HTML 文件
 ```
 
-Scan the QR code from WhatsApp:
-
-```text
-WhatsApp -> Linked devices -> Link a device
-```
-
-Start the gateway:
+在 WhatsApp 中选择 `设置 -> 已连接的设备 -> 连接设备` 扫码。配对成功后启动服务：
 
 ```bash
 npm start
 ```
 
-Check health:
+服务会在后台保持 WhatsApp 连接，认证信息保存在 `SESSION_DIR`。以后直接 `npm start` 即可，不需要重复扫码。
+
+## HTTP API
+
+健康检查不需要 token：
 
 ```bash
 curl http://127.0.0.1:3091/health
 ```
 
-Expected:
+发送消息：
+
+```bash
+curl -X POST http://127.0.0.1:3091/webhook \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"15551234567","message":"来自 pi-coding-agent 的消息"}'
+```
+
+请求格式：
 
 ```json
-{"ok":true,"status":"connected"}
+{
+  "to": "15551234567",
+  "message": "hello"
+}
 ```
 
-Then send a WhatsApp message from the allowed account.
+`to` 可以是带国家码的电话号码（不带 `+` 也可以）或完整 WhatsApp JID，例如 `15551234567@s.whatsapp.net`、群组 JID。`message` 超过 WhatsApp 单条长度时会自动拆分发送。
 
-## Configuration
+除了 `Authorization: Bearer ...`，也支持 `X-Webhook-Token` 请求头。`POST /send` 是 `/webhook` 的兼容别名。
 
-Copy `.env.example` to `.env` and edit these values:
-
-```dotenv
-WHATSAPP_ALLOWED_SENDERS=15551234567
-WHATSAPP_MODE=self-chat
-SELF_CHAT_REPLY_PREFIX=Pi Agent
-
-SESSION_DIR=./session
-HEALTH_HOST=127.0.0.1
-HEALTH_PORT=3091
-
-PI_BIN=pi
-PI_WORKDIR=.
-PI_MODEL=ollama/qwen3.6-35b-a3b-q8:latest
-PI_THINKING=high
-PI_TIMEOUT_MS=900000
-```
-
-Optional:
-
-```dotenv
-PI_APPEND_SYSTEM_PROMPT=/path/to/APPEND_SYSTEM.md
-```
-
-Use that if you keep a local Pi safety, memory, or operating-policy file.
-
-## Modes
-
-### self-chat
-
-Use this when the linked WhatsApp account is your own account and you message yourself.
-
-The bridge accepts your own `fromMe` self-chat messages and ignores its own replies using sent-message IDs and `SELF_CHAT_REPLY_PREFIX`.
-
-### bot
-
-Use this when you have a separate assistant WhatsApp account.
-
-Link the assistant account with QR pairing, then message it from your allowed owner number. In bot mode, `fromMe` messages are ignored.
-
-## Built-In Commands
-
-The gateway handles these locally before invoking Pi:
-
-```text
-/status
-/restart
-/resart
-```
-
-`/status` returns:
-
-- configured model
-- thinking level
-- gateway uptime
-- next cron job
-- RAM used
-- RAM free
-
-`/resart` is intentionally supported as a common typo. `/restart` and `/resart` both send an acknowledgement and exit the gateway so launchd, systemd, or your process manager can restart it and refresh the WhatsApp connection.
-
-## Run As A Service
-
-Templates are included:
-
-- macOS launchd: `launchd/com.example.pi-whatsapp.plist`
-- Linux systemd: `systemd/pi-whatsapp.service`
-
-Edit paths, usernames, and environment details before installing them.
-
-For macOS launchd, the typical flow is:
+也可以使用项目自带的 CLI 调用同一个 webhook：
 
 ```bash
-cp launchd/com.example.pi-whatsapp.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.example.pi-whatsapp.plist
-launchctl kickstart -k gui/$(id -u)/com.example.pi-whatsapp
+npm run send -- \
+  --to 15551234567 \
+  --message '来自 Pi TUI 的消息'
 ```
 
-For Linux systemd user services:
+CLI 默认读取 `.env` 中的 `WEBHOOK_TOKEN`、`WHATSAPP_HOST` 和 `WHATSAPP_PORT`。也可以用 `PI_WHATSAPP_WEBHOOK_URL` 指定远程服务地址，用 `PI_WHATSAPP_WEBHOOK_TOKEN` 指定 token。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "to": "15551234567@s.whatsapp.net",
+  "messageIds": ["..."]
+}
+```
+
+服务尚未连接时返回 HTTP 503；token 错误返回 401；请求格式错误返回 400。
+
+## 给 pi-coding-agent 使用
+
+推荐让一个 Pi 进程（包括 Pi TUI）拥有自己的 session，并由它调用本服务。不要让 WhatsApp 服务再启动第二个 Pi 进程。
+
+### 自动镜像每条 TUI 回复
+
+先设置 Pi extension 使用的配置：
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/pi-whatsapp.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now pi-whatsapp.service
+export PI_WHATSAPP_WEBHOOK_URL=http://127.0.0.1:3091/webhook
+export PI_WHATSAPP_WEBHOOK_TOKEN='replace-with-the-service-token'
+export PI_WHATSAPP_TO=15551234567
+
+# 让 WhatsApp 入站消息进入同一个 Pi TUI
+export PI_WHATSAPP_INBOUND_TOKEN='replace-with-the-inbound-token'
+export PI_WHATSAPP_INBOUND_PORT=3092
 ```
 
-## Repo Layout
+同时在 WhatsApp 服务的 `.env` 中设置：
+
+```dotenv
+WHATSAPP_INBOUND_URL=http://127.0.0.1:3092/whatsapp/inbound
+INBOUND_WEBHOOK_TOKEN=replace-with-the-inbound-token
+WHATSAPP_INBOUND_ALLOWED_SENDERS=15551234567
+WHATSAPP_INBOUND_MODE=bot
+```
+
+如果绑定的是自己的号码并从 WhatsApp 自聊窗口输入，改为 `WHATSAPP_INBOUND_MODE=self-chat`，并把自己的号码加入 `WHATSAPP_INBOUND_ALLOWED_SENDERS`。服务发出的回复会自动忽略，不会形成循环。
+
+然后从项目目录启动 Pi：
+
+```bash
+pi --extension ./extensions/whatsapp-mirror.mjs
+```
+
+启动 extension 后，允许列表中的 WhatsApp 文本会作为 user message 注入当前 TUI；每条完整的 assistant 文本会同时显示在 TUI，并发送到 `PI_WHATSAPP_TO`。镜像请求是异步的；WhatsApp 服务暂时断开时，Pi session 和 TUI 不会被中断，只会显示错误通知。
+
+如果在本项目目录启动，extension 也会尝试读取 `.env`；生产环境仍建议显式使用 `PI_WHATSAPP_*` 环境变量。
+
+Pi TUI 如果可以执行 shell 命令，可以直接调用：
+
+```bash
+npm run send -- --to "$PI_WHATSAPP_TO" --message '需要发送的内容'
+```
+
+也可以由 agent 直接调用 HTTP webhook：
+
+```bash
+curl -sS -X POST "$PI_WHATSAPP_WEBHOOK_URL" \
+  -H "Authorization: Bearer $PI_WHATSAPP_WEBHOOK_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "$(node -e 'console.log(JSON.stringify({to: process.argv[1], message: process.argv[2]}))' "$PI_WHATSAPP_TO" "$1")"
+```
+
+如果 agent 与服务在同一台机器上，默认地址就是 `http://127.0.0.1:3091/webhook`。建议把 token 放在 agent 的环境变量或 secret store 中，不要写进 prompt、代码仓库或日志。
+
+## 作为系统服务
+
+仓库提供了 macOS launchd 和 Linux systemd 模板。先修改其中的路径和 Node.js 路径，再安装：
+
+- `launchd/com.example.pi-whatsapp.plist`
+- `systemd/pi-whatsapp.service`
+
+系统服务需要能够读取项目目录下的 `.env` 和 `SESSION_DIR`。
+
+## 目录
 
 ```text
-src/gateway.mjs      WhatsApp Web listener and Pi runner
-src/pair.mjs         QR pairing helper that writes HTML/PNG
-src/lib.mjs          Pure helpers and status formatting
-test/lib.test.mjs    Unit tests for helpers
-skills/              Pi package skill loaded by pi install
-docs/                Architecture, security, troubleshooting
-launchd/             macOS service template
-systemd/             Linux service template
+src/pair.mjs       QR 配对并保存 WhatsApp 凭据
+src/gateway.mjs    WhatsApp 连接和 HTTP webhook 服务
+src/send.mjs       给 Pi TUI / shell 使用的 webhook CLI
+extensions/        可选 Pi TUI extension
+src/lib.mjs        环境变量、JID 和消息拆分等纯函数
+test/lib.test.mjs  单元测试
 ```
 
-## Development Checks
+## 检查
 
 ```bash
 npm run check
 npm test
-npm audit --omit=dev
 ```
 
-## Troubleshooting
+## 安全
 
-If QR pairing succeeds but messages are ignored:
-
-- confirm `WHATSAPP_MODE`
-- confirm `WHATSAPP_ALLOWED_SENDERS`
-- check `curl http://127.0.0.1:3091/health`
-- check whether the linked account is your own account or a separate bot account
-
-If WhatsApp logs out the linked device:
-
-```bash
-rm -rf session
-npm run pair
-open pairing/latest-qr.html
-```
-
-Then restart the gateway.
-
-More notes:
-
-- [Architecture](docs/architecture.md)
-- [Security](docs/security.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
-## Suggested GitHub Description And Topics
-
-Repository description:
-
-```text
-WhatsApp setup for Pi Agent: a local WhatsApp Web/Baileys bridge for running Pi from WhatsApp.
-```
-
-Suggested GitHub topics:
-
-```text
-pi-agent
-pi-package
-whatsapp
-whatsapp-web
-baileys
-ai-agent
-local-ai
-self-hosted
-chatbot
-automation
-agent-gateway
-nodejs
-```
-
-GitHub topics are set in the repository's About panel after the repo is created.
-
-## Publish Checklist
-
-Before making a GitHub repo public:
-
-```bash
-git status --short
-rg -n "token|secret|password|api[_-]?key|session|wa_id|phone|1555|/Users|\.env" .
-npm run check
-npm test
-npm audit --omit=dev
-npm pack --dry-run
-```
-
-Review every hit. The included examples are placeholders only.
-
-To publish to npm:
-
-```bash
-npm login
-npm publish --access public
-```
-
-The package is prepared for pi.dev discovery with the `pi-package` keyword and a `pi.skills` manifest in `package.json`.
+- 默认只监听 `127.0.0.1`，需要远程访问时请使用 HTTPS 反向代理。
+- 必须设置足够随机的 `WEBHOOK_TOKEN`，否则服务不会启动。
+- 入站转发必须配置 `WHATSAPP_INBOUND_ALLOWED_SENDERS`，不要直接使用 `*`。
+- 不要提交 `.env`、`session/`、`pairing/` 和日志。
+- WhatsApp Web 自动化是非官方方案，可能受 WhatsApp 变更影响。
 
 ## License
 
