@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -9,12 +10,16 @@ import {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent } from "undici";
 import { loadEnvFile } from "./lib.mjs";
 
 loadEnvFile(path.resolve(".env"));
 
 const sessionDir = process.env.SESSION_DIR || "./session";
 const pairingDir = process.env.PAIRING_DIR || "./pairing";
+const proxyUrl = process.env.PI_WHATSAPP_PROXY || process.env.HTTPS_PROXY ||
+  process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
 
 fs.mkdirSync(sessionDir, { recursive: true });
 fs.mkdirSync(pairingDir, { recursive: true });
@@ -27,10 +32,9 @@ function writeStatus(status) {
 }
 
 async function writeQr(qr) {
-  const pngPath = path.join(pairingDir, "latest-qr.png");
-  const htmlPath = path.join(pairingDir, "latest-qr.html");
+  const pngPath = path.resolve(pairingDir, "latest-qr.png");
+  const htmlPath = path.resolve(pairingDir, "latest-qr.html");
   await QRCode.toFile(pngPath, qr, { width: 768, margin: 2 });
-  const terminalQr = await QRCode.toString(qr, { type: "terminal", small: false });
   fs.writeFileSync(path.join(pairingDir, "latest-qr.txt"), `${qr}\n`);
   fs.writeFileSync(
     htmlPath,
@@ -60,16 +64,17 @@ async function writeQr(qr) {
 `
   );
   writeStatus({ status: "qr_ready", pngPath, htmlPath });
-  console.log("\nScan this QR code with WhatsApp > Linked devices > Link a device:\n");
-  console.log(terminalQr);
-  console.error(`QR page: ${htmlPath}`);
+  console.log(pathToFileURL(pngPath).href);
 }
 
 const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-const { version } = await fetchLatestBaileysVersion();
+const { version } = await fetchLatestBaileysVersion(
+  proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {}
+);
 const sock = makeWASocket({
   version,
   auth: state,
+  ...(proxyUrl ? { agent: new HttpsProxyAgent(proxyUrl) } : {}),
   logger: pino({ level: "warn" }),
   browser: ["Pi WhatsApp Setup", "Chrome", "120.0"],
   syncFullHistory: false,

@@ -2,28 +2,33 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 function readDotEnv(cwd) {
   const values = {};
-  try {
-    const text = fs.readFileSync(path.join(cwd, ".env"), "utf8");
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const index = trimmed.indexOf("=");
-      if (index < 0) continue;
-      const key = trimmed.slice(0, index).trim();
-      let value = trimmed.slice(index + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
+  const projectEnv = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".env");
+  const candidates = [...new Set([projectEnv, path.resolve(cwd, ".env")])];
+  for (const filePath of candidates) {
+    try {
+      const text = fs.readFileSync(filePath, "utf8");
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const index = trimmed.indexOf("=");
+        if (index < 0) continue;
+        const key = trimmed.slice(0, index).trim();
+        let value = trimmed.slice(index + 1).trim();
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+        }
+        if (key && values[key] === undefined) values[key] = value;
       }
-      if (key) values[key] = value;
+    } catch {
+      // Environment variables are enough when no project .env is available.
     }
-  } catch {
-    // Environment variables are enough when Pi runs outside this project.
   }
   return values;
 }

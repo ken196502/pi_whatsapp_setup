@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -10,6 +11,8 @@ import {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent } from "undici";
 import {
   isAllowedSender,
   loadEnvFile,
@@ -20,6 +23,9 @@ import {
 } from "./lib.mjs";
 
 loadEnvFile(path.resolve(".env"));
+
+const proxyUrl = process.env.PI_WHATSAPP_PROXY || process.env.HTTPS_PROXY ||
+  process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
 
 const config = {
   sessionDir: process.env.SESSION_DIR || "./session",
@@ -253,10 +259,13 @@ async function startSocket() {
   status = "connecting";
   fs.mkdirSync(config.sessionDir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchLatestBaileysVersion(
+    proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {}
+  );
   sock = makeWASocket({
     version,
     auth: state,
+    ...(proxyUrl ? { agent: new HttpsProxyAgent(proxyUrl) } : {}),
     logger,
     browser: ["WhatsApp Service", "Chrome", "120.0"],
     syncFullHistory: false,
@@ -267,9 +276,11 @@ async function startSocket() {
   sock.ev.on("creds.update", saveCreds);
   sock.ev.on("connection.update", async (update) => {
     if (update.qr) {
-      const terminalQr = await QRCode.toString(update.qr, { type: "terminal", small: false });
-      console.log("\nScan this QR code with WhatsApp > Linked devices > Link a device:\n");
-      console.log(terminalQr);
+      const pairingDir = process.env.PAIRING_DIR || "./pairing";
+      const pngPath = path.resolve(pairingDir, "latest-qr.png");
+      fs.mkdirSync(pairingDir, { recursive: true });
+      await QRCode.toFile(pngPath, update.qr, { width: 768, margin: 2 });
+      console.log(pathToFileURL(pngPath).href);
     }
     if (update.connection === "open") {
       status = "connected";

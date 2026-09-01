@@ -33,6 +33,8 @@ npm run pair
 open pairing/latest-qr.html       # macOS；其他系统直接打开该 HTML 文件
 ```
 
+配对命令会生成 `pairing/latest-qr.html` 和 `pairing/latest-qr.png`，并在终端打印 PNG 的 `file://` 链接。点击链接打开图片后，用 WhatsApp 扫描 QR；QR 会定期更换，请保持命令运行。
+
 在 WhatsApp 中选择 `设置 -> 已连接的设备 -> 连接设备` 扫码。配对成功后启动服务：
 
 ```bash
