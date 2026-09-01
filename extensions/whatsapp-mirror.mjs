@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,7 +43,52 @@ function getText(message) {
     .trim();
 }
 
-function mirror(text, settings) {
+function isLoopbackUrl(value) {
+  const hostname = new URL(value).hostname.toLowerCase();
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+function postDirect(urlValue, body, token) {
+  const url = new URL(urlValue);
+  const payload = JSON.stringify(body);
+  const transport = url.protocol === "https:" ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const request = transport.request(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+      },
+    }, (response) => {
+      let raw = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { raw += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode || 0, raw }));
+    });
+    request.setTimeout(15000, () => request.destroy(new Error("webhook request timed out")));
+    request.on("error", reject);
+    request.end(payload);
+  });
+}
+
+async function mirror(text, settings) {
+  const payload = { to: settings.to, message: text };
+  if (isLoopbackUrl(settings.url)) {
+    const response = await postDirect(settings.url, payload, settings.token);
+    let body;
+    try {
+      body = JSON.parse(response.raw);
+    } catch {
+      body = { error: response.raw || `HTTP ${response.status}` };
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(body.error || `HTTP ${response.status}`);
+    }
+    return;
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
   return fetch(settings.url, {
@@ -51,7 +97,7 @@ function mirror(text, settings) {
       authorization: `Bearer ${settings.token}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ to: settings.to, message: text }),
+    body: JSON.stringify(payload),
     signal: controller.signal,
   }).then(async (response) => {
     const raw = await response.text();
@@ -205,4 +251,4 @@ export default function whatsappMirror(pi) {
   });
 }
 
-export { getText };
+export { getText, mirror };

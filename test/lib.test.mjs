@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { describe, it } from "node:test";
 import {
   isAllowedSender,
@@ -8,7 +9,7 @@ import {
   splitMessage,
   toWhatsAppJid,
 } from "../src/lib.mjs";
-import { getText } from "../extensions/whatsapp-mirror.mjs";
+import { getText, mirror } from "../extensions/whatsapp-mirror.mjs";
 
 describe("lib helpers", () => {
   it("loads a simple env file without overwriting existing values", () => {
@@ -47,5 +48,30 @@ describe("lib helpers", () => {
       "hello",
     );
     assert.equal(getText({ role: "user", content: [{ type: "text", text: "hello" }] }), "");
+  });
+
+  it("sends loopback mirror requests directly", async () => {
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        assert.equal(req.headers.authorization, "Bearer test-token");
+        assert.deepEqual(JSON.parse(body), { to: "15551234567", message: "hello" });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+    try {
+      await mirror("hello", {
+        url: `http://127.0.0.1:${port}/webhook`,
+        token: "test-token",
+        to: "15551234567",
+      });
+    } finally {
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });
